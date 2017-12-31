@@ -14,7 +14,6 @@ use ring::{digest, hkdf, hmac, aead};
 use ring::constant_time::verify_slices_are_equal;
 use ring::hmac::SigningKey;
 use ring::rand::{SecureRandom, SystemRandom};
-use openssl::sha;
 use openssl::symm::{Cipher, Mode, Crypter};
 
 use rustbreak::Database;
@@ -61,9 +60,10 @@ fn make_subkey(key: &str, salt: &[u8], keysize: usize) -> Vec<u8> {
 /// Encrypt file with AES128-CFB128 and authorize ciphertext with SHA-256 HMAC.
 fn encrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> error::Result<()> {
     let hash = hash_file(&path)?;
-    let base32_hash = base32_encode(&hash);
-    let subkey = make_subkey(key, &hash, 16);
-    let signing_key = make_subkey(key, &hash, 32);
+    let hash= hash.as_ref();
+    let base32_hash = base32_encode(hash);
+    let subkey = make_subkey(key, hash, 16);
+    let signing_key = make_subkey(key, hash, 32);
     let mut iv = [0; 16];
     SystemRandom::new().fill(&mut iv)?;
     let mut encrypter = Crypter::new(Cipher::aes_128_cfb128(), Mode::Encrypt, &subkey, Some(&iv))?;
@@ -149,8 +149,8 @@ fn decrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> er
     Ok(())
 }
 
-fn hash_file<P: AsRef<Path>>(path: P) -> error::Result<[u8; 32]> {
-    let mut hasher = sha::Sha256::new();
+fn hash_file<P: AsRef<Path>>(path: P) -> error::Result<digest::Digest> {
+    let mut hasher = digest::Context::new(&digest::SHA256);
     let mut buf = [0u8; 1024];
 
     hasher.update(path.as_ref().to_str().unwrap().as_bytes());
@@ -180,7 +180,7 @@ fn encrypt<P: AsRef<Path>>(path: P, password: &str, db: &Database<String>) -> er
         } else if file_type.is_dir() {
             let mut new_path = PathBuf::new();
             new_path.push(path.parent().unwrap());
-            new_path.push(base32_encode(&hash_file(&path)?));
+            new_path.push(base32_encode(hash_file(&path)?.as_ref()));
             fs::rename(&path, &new_path)?;
             db.insert(
                 &path_to_string(&new_path),
