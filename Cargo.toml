@@ -1,5 +1,5 @@
 [package]
-name = "aeadfs"
+name = "aefs"
 version = "0.1.0"
 authors = ["BennyYip <yebenmy@protonmail.com>"]
 

@@ -29,8 +29,8 @@ pub mod error;
 const SUBKEY_INFO: &[u8] = b"crypto-szu";
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct MetaData {
-    path: String,
+struct MetaData {
+    filename: String,
     tag: Option<Vec<u8>>,
 }
 
@@ -46,6 +46,10 @@ fn base32_decode(data: &str) -> Option<Vec<u8>> {
     base32::decode(base32::Alphabet::Crockford, data)
 }
 
+/// Derive subkey with SHA-256 hkdf(RFC5869).
+/// key: master key
+/// salt: non-secret random value
+/// keysize: sub key size
 fn make_subkey(key: &str, salt: &[u8], keysize: usize) -> Vec<u8> {
     let salt = SigningKey::new(&digest::SHA256, salt);
     let mut subkey = Vec::with_capacity(keysize);
@@ -54,52 +58,7 @@ fn make_subkey(key: &str, salt: &[u8], keysize: usize) -> Vec<u8> {
     subkey
 }
 
-fn decrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> error::Result<()> {
-    let base32_hash = path_to_string(path.as_ref().file_name().unwrap());
-    let hash = base32_decode(&base32_hash).unwrap();
-    let metadata: MetaData = db.retrieve(&base32_hash)?;
-    let subkey = make_subkey(key, &hash, 16);
-    let signing_key = make_subkey(key, &hash, 32);
-    let mut iv = [0; 16];
-
-    let mut input = BufReader::new(File::open(&path)?);
-    input.read_exact(&mut iv)?;
-
-    let mut ciphertext = [0u8; 1024];
-    let signing_key = hmac::SigningKey::new(&digest::SHA256, &signing_key);
-    let mut signing_ctx = hmac::SigningContext::with_key(&signing_key);
-    while let Ok(n) = input.read(&mut ciphertext) {
-        if n == 0 {
-            break;
-        }
-        signing_ctx.update(&ciphertext[..n]);
-    }
-    let signature = signing_ctx.sign();
-    verify_slices_are_equal(signature.as_ref(), &metadata.tag.unwrap())?;
-
-    let mut output_path = PathBuf::new();
-    output_path.push(path.as_ref().parent().unwrap());
-    output_path.push(&metadata.path);
-    // skip iv;
-    input.seek(SeekFrom::Start(16))?;
-    let mut output = BufWriter::new(File::create(output_path)?);
-    let mut decrypter = Crypter::new(Cipher::aes_128_cfb128(), Mode::Decrypt, &subkey, Some(&iv))?;
-    let mut plaintext = [0u8; 1024 + 16];
-
-    while let Ok(n) = input.read(&mut ciphertext) {
-        if n == 0 {
-            break;
-        }
-        let count = decrypter.update(&ciphertext[..n], &mut plaintext)?;
-        output.write_all(&plaintext[..count])?;
-    }
-    let count = decrypter.finalize(&mut plaintext)?;
-    output.write_all(&plaintext[..count])?;
-    remove_file(&path)?;
-
-    Ok(())
-}
-
+/// Encrypt file with AES128-CFB128 and authorize ciphertext with SHA-256 HMAC.
 fn encrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> error::Result<()> {
     let hash = hash_file(&path)?;
     let base32_hash = base32_encode(&hash);
@@ -134,12 +93,59 @@ fn encrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> er
     db.insert(
         &base32_hash,
         MetaData {
-            path: path_to_string(&path.as_ref().file_name().unwrap()),
+            filename: path_to_string(&path.as_ref().file_name().unwrap()),
             tag: Some(signature.as_ref().to_vec()),
         },
     )?;
 
     remove_file(&path)?;
+    Ok(())
+}
+
+/// Verify Ciphertext with SHA-256 HMAC and decrypt file with AES128-CFB128.
+fn decrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> error::Result<()> {
+    let base32_hash = path_to_string(path.as_ref().file_name().unwrap());
+    let hash = base32_decode(&base32_hash).unwrap();
+    let metadata: MetaData = db.retrieve(&base32_hash)?;
+    let subkey = make_subkey(key, &hash, 16);
+    let signing_key = make_subkey(key, &hash, 32);
+    let mut iv = [0; 16];
+
+    let mut input = BufReader::new(File::open(&path)?);
+    input.read_exact(&mut iv)?;
+
+    let mut ciphertext = [0u8; 1024];
+    let signing_key = hmac::SigningKey::new(&digest::SHA256, &signing_key);
+    let mut signing_ctx = hmac::SigningContext::with_key(&signing_key);
+    while let Ok(n) = input.read(&mut ciphertext) {
+        if n == 0 {
+            break;
+        }
+        signing_ctx.update(&ciphertext[..n]);
+    }
+    let signature = signing_ctx.sign();
+    verify_slices_are_equal(signature.as_ref(), &metadata.tag.unwrap())?;
+
+    let mut output_path = PathBuf::new();
+    output_path.push(path.as_ref().parent().unwrap());
+    output_path.push(&metadata.filename);
+    // skip iv;
+    input.seek(SeekFrom::Start(16))?;
+    let mut output = BufWriter::new(File::create(output_path)?);
+    let mut decrypter = Crypter::new(Cipher::aes_128_cfb128(), Mode::Decrypt, &subkey, Some(&iv))?;
+    let mut plaintext = [0u8; 1024 + 16];
+
+    while let Ok(n) = input.read(&mut ciphertext) {
+        if n == 0 {
+            break;
+        }
+        let count = decrypter.update(&ciphertext[..n], &mut plaintext)?;
+        output.write_all(&plaintext[..count])?;
+    }
+    let count = decrypter.finalize(&mut plaintext)?;
+    output.write_all(&plaintext[..count])?;
+    remove_file(&path)?;
+
     Ok(())
 }
 
@@ -166,8 +172,9 @@ fn encrypt<P: AsRef<Path>>(path: P, password: &str, db: &Database<String>) -> er
         let entry = entry?;
         let file_type = entry.file_type()?;
         let path = entry.path();
+        // TODO: handle symlink
         if file_type.is_file() {
-            if path.file_name().unwrap() != ".aeadfs-index" {
+            if path.file_name().unwrap() != ".aefs-index" {
                 encrypt_file(path, password, db)?;
             }
         } else if file_type.is_dir() {
@@ -178,7 +185,7 @@ fn encrypt<P: AsRef<Path>>(path: P, password: &str, db: &Database<String>) -> er
             db.insert(
                 &path_to_string(&new_path),
                 MetaData {
-                    path: path_to_string(&path.file_name().unwrap()),
+                    filename: path_to_string(&path.file_name().unwrap()),
                     tag: None,
                 },
             )?;
@@ -193,15 +200,16 @@ fn decrypt<P: AsRef<Path>>(path: P, password: &str, db: &Database<String>) -> er
         let entry = entry?;
         let file_type = entry.file_type()?;
         let path = entry.path();
+        // TODO: handle symlink
         if file_type.is_file() {
-            if path.file_name().unwrap() != ".aeadfs-index" {
+            if path.file_name().unwrap() != ".aefs-index" {
                 decrypt_file(path, password, db)?;
             }
         } else if file_type.is_dir() {
             let metadata: MetaData = db.retrieve(&path_to_string(&path))?;
             let mut new_path = PathBuf::new();
             new_path.push(path.parent().unwrap());
-            new_path.push(metadata.path);
+            new_path.push(metadata.filename);
             fs::rename(&path, &new_path)?;
             decrypt(&new_path, password, db)?;
         }
@@ -248,15 +256,15 @@ fn start() -> error::Result<()> {
     let encrypt_or_decrypt = std::env::args().nth(1).unwrap();
     let password = std::env::args().nth(2).unwrap();
     if encrypt_or_decrypt == "e" {
-        let db = Database::open(".aeadfs-index").unwrap();
+        let db = Database::open(".aefs-index").unwrap();
         encrypt(".", &password, &db)?;
         db.flush()?;
-        encrypt_db(".aeadfs-index", &password)?;
+        encrypt_db(".aefs-index", &password)?;
     } else if encrypt_or_decrypt == "d" {
-        decrypt_db(".aeadfs-index", &password)?;
-        let db = Database::open(".aeadfs-index").unwrap();
+        decrypt_db(".aefs-index", &password)?;
+        let db = Database::open(".aefs-index").unwrap();
         decrypt(".", &password, &db)?;
-        remove_file(".aeadfs-index")?;
+        remove_file(".aefs-index")?;
     }
     Ok(())
 }
