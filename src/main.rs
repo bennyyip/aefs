@@ -6,17 +6,19 @@ extern crate serde_derive;
 extern crate bincode;
 extern crate rustbreak;
 
+extern crate bytes;
+
 extern crate ring;
 extern crate openssl;
 extern crate base32;
 
-use ring::{digest, hkdf, hmac, aead};
+use ring::{digest, pbkdf2, hmac, aead};
 use ring::constant_time::verify_slices_are_equal;
-use ring::hmac::SigningKey;
 use ring::rand::{SecureRandom, SystemRandom};
 use openssl::symm::{Cipher, Mode, Crypter};
 
 use rustbreak::Database;
+use bytes::{BytesMut, Bytes};
 
 use std::fs::{self, File, remove_file};
 use std::io::prelude::*;
@@ -25,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::convert::AsRef;
 pub mod error;
 
-const SUBKEY_INFO: &[u8] = b"crypto-szu";
+const BUFFER_SIZE: usize = 2048;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct MetaData {
@@ -45,38 +47,47 @@ fn base32_decode(data: &str) -> Option<Vec<u8>> {
     base32::decode(base32::Alphabet::Crockford, data)
 }
 
-/// Derive subkey with SHA-256 hkdf(RFC5869).
-/// key: master key
-/// salt: non-secret random value
-/// keysize: sub key size
-fn make_subkey(key: &str, salt: &[u8], keysize: usize) -> Vec<u8> {
-    let salt = SigningKey::new(&digest::SHA256, salt);
-    let mut subkey = Vec::with_capacity(keysize);
-    subkey.resize(keysize, 0);
-    hkdf::extract_and_expand(&salt, key.as_bytes(), SUBKEY_INFO, &mut subkey);
-    subkey
+fn alloc_buf(size: usize) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(size);
+    unsafe {
+        buf.set_len(size);
+    }
+    buf
+}
+
+/// Derive subkey with SHA-256 pbkdf2
+fn make_subkey(key: &str, salt: &[u8], keysize: usize) -> Bytes {
+    let mut subkey = alloc_buf(keysize);
+    pbkdf2::derive(&digest::SHA256, 100_000, salt, key.as_bytes(), &mut subkey);
+    subkey.freeze()
 }
 
 /// Encrypt file with AES128-CFB128 and authorize ciphertext with SHA-256 HMAC.
 fn encrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> error::Result<()> {
     let hash = hash_file(&path)?;
-    let hash= hash.as_ref();
+    let hash = hash.as_ref();
     let base32_hash = base32_encode(hash);
-    let subkey = make_subkey(key, hash, 16);
-    let signing_key = make_subkey(key, hash, 32);
-    let mut iv = [0; 16];
+
+    let cipher = Cipher::aes_128_cfb128();
+    let iv_len = cipher.iv_len().unwrap_or(0);
+    let block_size = cipher.block_size();
+    let mut iv = alloc_buf(iv_len);
     SystemRandom::new().fill(&mut iv)?;
-    let mut encrypter = Crypter::new(Cipher::aes_128_cfb128(), Mode::Encrypt, &subkey, Some(&iv))?;
+    let subkey = make_subkey(key, hash, cipher.key_len());
+    let mut encrypter = Crypter::new(cipher, Mode::Encrypt, &subkey, Some(&iv))?;
+
+    let signing_key = make_subkey(key, &hash, hmac::recommended_key_len(&digest::SHA256));
     let signing_key = hmac::SigningKey::new(&digest::SHA256, &signing_key);
     let mut signing_ctx = hmac::SigningContext::with_key(&signing_key);
 
-    let mut input = File::open(&path)?;
+    let mut plaintext = alloc_buf(BUFFER_SIZE);
+    let mut ciphertext = alloc_buf(BUFFER_SIZE + block_size);
+
+    let mut input = BufReader::new(File::open(&path)?);
     let mut output_path = PathBuf::new();
     output_path.push(path.as_ref().parent().unwrap());
     output_path.push(&base32_hash);
-    let mut output = File::create(&output_path)?;
-    let mut plaintext = [0u8; 1024];
-    let mut ciphertext = [0u8; 1024 + 16];
+    let mut output = BufWriter::new(File::create(&output_path)?);
 
     output.write_all(&iv)?;
     while let Ok(n) = input.read(&mut plaintext) {
@@ -89,6 +100,7 @@ fn encrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> er
     }
     let count = encrypter.finalize(&mut ciphertext)?;
     output.write_all(&ciphertext[..count])?;
+
     let signature = signing_ctx.sign();
     db.insert(
         &base32_hash,
@@ -107,14 +119,19 @@ fn decrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> er
     let base32_hash = path_to_string(path.as_ref().file_name().unwrap());
     let hash = base32_decode(&base32_hash).unwrap();
     let metadata: MetaData = db.retrieve(&base32_hash)?;
-    let subkey = make_subkey(key, &hash, 16);
-    let signing_key = make_subkey(key, &hash, 32);
-    let mut iv = [0; 16];
+
+    let cipher = Cipher::aes_128_cfb128();
+    let iv_len = cipher.iv_len().unwrap_or(0);
+    let subkey = make_subkey(key, &hash, cipher.key_len());
+    let block_size = cipher.block_size();
+    let mut iv = alloc_buf(iv_len);
+
+    let signing_key = make_subkey(key, &hash, hmac::recommended_key_len(&digest::SHA256));
 
     let mut input = BufReader::new(File::open(&path)?);
     input.read_exact(&mut iv)?;
 
-    let mut ciphertext = [0u8; 1024];
+    let mut ciphertext = alloc_buf(BUFFER_SIZE);
     let signing_key = hmac::SigningKey::new(&digest::SHA256, &signing_key);
     let mut signing_ctx = hmac::SigningContext::with_key(&signing_key);
     while let Ok(n) = input.read(&mut ciphertext) {
@@ -130,10 +147,10 @@ fn decrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> er
     output_path.push(path.as_ref().parent().unwrap());
     output_path.push(&metadata.filename);
     // skip iv;
-    input.seek(SeekFrom::Start(16))?;
+    input.seek(SeekFrom::Start(iv_len as u64))?;
     let mut output = BufWriter::new(File::create(output_path)?);
-    let mut decrypter = Crypter::new(Cipher::aes_128_cfb128(), Mode::Decrypt, &subkey, Some(&iv))?;
-    let mut plaintext = [0u8; 1024 + 16];
+    let mut decrypter = Crypter::new(cipher, Mode::Decrypt, &subkey, Some(&iv))?;
+    let mut plaintext = alloc_buf(BUFFER_SIZE + block_size);
 
     while let Ok(n) = input.read(&mut ciphertext) {
         if n == 0 {
@@ -144,6 +161,7 @@ fn decrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> er
     }
     let count = decrypter.finalize(&mut plaintext)?;
     output.write_all(&plaintext[..count])?;
+
     remove_file(&path)?;
 
     Ok(())
@@ -151,11 +169,14 @@ fn decrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> er
 
 fn hash_file<P: AsRef<Path>>(path: P) -> error::Result<digest::Digest> {
     let mut hasher = digest::Context::new(&digest::SHA256);
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; BUFFER_SIZE];
 
+    // hash path
     hasher.update(path.as_ref().to_str().unwrap().as_bytes());
+
+    // hash file content is any
     if path.as_ref().is_file() {
-        let mut file = File::open(&path)?;
+        let mut file = BufReader::new(File::open(&path)?);
         while let Ok(n) = file.read(&mut buf) {
             if n == 0 {
                 break;
@@ -164,6 +185,7 @@ fn hash_file<P: AsRef<Path>>(path: P) -> error::Result<digest::Digest> {
         }
     }
     let hash = hasher.finish();
+
     Ok(hash)
 }
 
@@ -172,7 +194,7 @@ fn encrypt<P: AsRef<Path>>(path: P, password: &str, db: &Database<String>) -> er
         let entry = entry?;
         let file_type = entry.file_type()?;
         let path = entry.path();
-        // TODO: handle symlink
+
         if file_type.is_file() {
             if path.file_name().unwrap() != ".aefs-index" {
                 encrypt_file(path, password, db)?;
@@ -181,7 +203,9 @@ fn encrypt<P: AsRef<Path>>(path: P, password: &str, db: &Database<String>) -> er
             let mut new_path = PathBuf::new();
             new_path.push(path.parent().unwrap());
             new_path.push(base32_encode(hash_file(&path)?.as_ref()));
+
             fs::rename(&path, &new_path)?;
+
             db.insert(
                 &path_to_string(&new_path),
                 MetaData {
@@ -189,6 +213,7 @@ fn encrypt<P: AsRef<Path>>(path: P, password: &str, db: &Database<String>) -> er
                     tag: None,
                 },
             )?;
+
             encrypt(&new_path, password, db)?;
         }
     }
@@ -200,17 +225,20 @@ fn decrypt<P: AsRef<Path>>(path: P, password: &str, db: &Database<String>) -> er
         let entry = entry?;
         let file_type = entry.file_type()?;
         let path = entry.path();
-        // TODO: handle symlink
+
         if file_type.is_file() {
             if path.file_name().unwrap() != ".aefs-index" {
                 decrypt_file(path, password, db)?;
             }
         } else if file_type.is_dir() {
             let metadata: MetaData = db.retrieve(&path_to_string(&path))?;
+
             let mut new_path = PathBuf::new();
             new_path.push(path.parent().unwrap());
             new_path.push(metadata.filename);
+
             fs::rename(&path, &new_path)?;
+
             decrypt(&new_path, password, db)?;
         }
     }
@@ -226,14 +254,21 @@ fn encrypt_db<P: AsRef<Path>>(path: P, password: &str) -> error::Result<()> {
     SystemRandom::new().fill(&mut nonce_and_salt)?;
     let nonce = &nonce_and_salt[..12];
     let salt = &nonce_and_salt[12..];
+
     let subkey = make_subkey(password, salt, 32);
+
     let sealing_key = aead::SealingKey::new(&aead::CHACHA20_POLY1305, &subkey)?;
+
     let mut in_out = fs::read(&path)?;
+
+    // 16-byte tag
     in_out.extend([0; 16].iter());
     aead::seal_in_place(&sealing_key, nonce, &nonce_and_salt, &mut in_out, tag_len)?;
-    let mut output_file = File::create(&path)?;
+
+    let mut output_file = BufWriter::new(File::create(&path)?);
     output_file.write_all(&nonce_and_salt)?;
     output_file.write_all(&in_out)?;
+
     Ok(())
 }
 
@@ -246,9 +281,12 @@ fn decrypt_db<P: AsRef<Path>>(path: P, password: &str) -> error::Result<()> {
     let nonce = &nonce_and_salt[..12];
     let salt = &nonce_and_salt[12..];
     let subkey = make_subkey(password, salt, 32);
+
     let opening_key = aead::OpeningKey::new(&aead::CHACHA20_POLY1305, &subkey)?;
     let plaintext = aead::open_in_place(&opening_key, nonce, nonce_and_salt, 12 + 32, &mut in_out)?;
+
     fs::write(&path, plaintext)?;
+
     Ok(())
 }
 
