@@ -76,7 +76,11 @@ fn encrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> er
     let subkey = make_subkey(key, hash, cipher.key_len());
     let mut encrypter = Crypter::new(cipher, Mode::Encrypt, &subkey, Some(&iv))?;
 
-    let signing_key = make_subkey(key, &hash, hmac::recommended_key_len(&digest::SHA256));
+    let signing_key = make_subkey(
+        key,
+        subkey.as_ref(),
+        hmac::recommended_key_len(&digest::SHA256),
+    );
     let signing_key = hmac::SigningKey::new(&digest::SHA256, &signing_key);
     let mut signing_ctx = hmac::SigningContext::with_key(&signing_key);
 
@@ -90,6 +94,7 @@ fn encrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> er
     let mut output = BufWriter::new(File::create(&output_path)?);
 
     output.write_all(&iv)?;
+    signing_ctx.update(&iv[..]);
     while let Ok(n) = input.read(&mut plaintext) {
         if n == 0 {
             break;
@@ -126,7 +131,11 @@ fn decrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> er
     let block_size = cipher.block_size();
     let mut iv = alloc_buf(iv_len);
 
-    let signing_key = make_subkey(key, &hash, hmac::recommended_key_len(&digest::SHA256));
+    let signing_key = make_subkey(
+        key,
+        subkey.as_ref(),
+        hmac::recommended_key_len(&digest::SHA256),
+    );
 
     let mut input = BufReader::new(File::open(&path)?);
     input.read_exact(&mut iv)?;
@@ -134,6 +143,8 @@ fn decrypt_file<P: AsRef<Path>>(path: P, key: &str, db: &Database<String>) -> er
     let mut ciphertext = alloc_buf(BUFFER_SIZE);
     let signing_key = hmac::SigningKey::new(&digest::SHA256, &signing_key);
     let mut signing_ctx = hmac::SigningContext::with_key(&signing_key);
+
+    signing_ctx.update(&iv[..]);
     while let Ok(n) = input.read(&mut ciphertext) {
         if n == 0 {
             break;
@@ -174,7 +185,7 @@ fn hash_file<P: AsRef<Path>>(path: P) -> error::Result<digest::Digest> {
     // hash path
     hasher.update(path.as_ref().to_str().unwrap().as_bytes());
 
-    // hash file content is any
+    // hash file content if any
     if path.as_ref().is_file() {
         let mut file = BufReader::new(File::open(&path)?);
         while let Ok(n) = file.read(&mut buf) {
