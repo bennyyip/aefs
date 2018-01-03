@@ -5,6 +5,9 @@ extern crate error_chain;
 extern crate serde_derive;
 extern crate bincode;
 extern crate rustbreak;
+extern crate structopt;
+#[macro_use]
+extern crate structopt_derive;
 
 extern crate bytes;
 
@@ -19,6 +22,7 @@ use openssl::symm::{Cipher, Mode, Crypter};
 
 use rustbreak::Database;
 use bytes::{BytesMut, Bytes};
+use structopt::StructOpt;
 
 use std::fs::{self, File, remove_file};
 use std::io::prelude::*;
@@ -34,6 +38,16 @@ struct MetaData {
     filename: String,
     tag: Option<Vec<u8>>,
 }
+
+#[derive(StructOpt, Debug)]
+#[structopt(name = "aefs", about = "Authenticated Encrypted File System ")]
+struct Opt {
+    #[structopt(value_name = "encrypt_or_decrypt", help = "e: encrypt; d: decrypt")]
+    encrypt_or_decrypt: String,
+    #[structopt(value_name = "password")]
+    password: String,
+}
+
 
 fn path_to_string<P: AsRef<Path>>(path: P) -> String {
     path.as_ref().to_str().unwrap().to_string()
@@ -212,13 +226,13 @@ fn encrypt<P: AsRef<Path>>(path: P, password: &str, db: &Database<String>) -> er
             }
         } else if file_type.is_dir() {
             let mut new_path = PathBuf::new();
+            let base32_hash = base32_encode(hash_file(&path)?.as_ref());
             new_path.push(path.parent().unwrap());
-            new_path.push(base32_encode(hash_file(&path)?.as_ref()));
-
+            new_path.push(&base32_hash);
             fs::rename(&path, &new_path)?;
 
             db.insert(
-                &path_to_string(&new_path),
+                &path_to_string(base32_hash),
                 MetaData {
                     filename: path_to_string(&path.file_name().unwrap()),
                     tag: None,
@@ -242,7 +256,7 @@ fn decrypt<P: AsRef<Path>>(path: P, password: &str, db: &Database<String>) -> er
                 decrypt_file(path, password, db)?;
             }
         } else if file_type.is_dir() {
-            let metadata: MetaData = db.retrieve(&path_to_string(&path))?;
+            let metadata: MetaData = db.retrieve(&path_to_string(path.file_name().unwrap()))?;
 
             let mut new_path = PathBuf::new();
             new_path.push(path.parent().unwrap());
@@ -302,17 +316,17 @@ fn decrypt_db<P: AsRef<Path>>(path: P, password: &str) -> error::Result<()> {
 }
 
 fn start() -> error::Result<()> {
-    let encrypt_or_decrypt = std::env::args().nth(1).unwrap();
-    let password = std::env::args().nth(2).unwrap();
-    if encrypt_or_decrypt == "e" {
+    let opt = Opt::from_args();
+
+    if opt.encrypt_or_decrypt == "e" {
         let db = Database::open(".aefs-index").unwrap();
-        encrypt(".", &password, &db)?;
+        encrypt(".", &opt.password, &db)?;
         db.flush()?;
-        encrypt_db(".aefs-index", &password)?;
-    } else if encrypt_or_decrypt == "d" {
-        decrypt_db(".aefs-index", &password)?;
+        encrypt_db(".aefs-index", &opt.password)?;
+    } else if opt.encrypt_or_decrypt == "d" {
+        decrypt_db(".aefs-index", &opt.password)?;
         let db = Database::open(".aefs-index").unwrap();
-        decrypt(".", &password, &db)?;
+        decrypt(".", &opt.password, &db)?;
         remove_file(".aefs-index")?;
     }
     Ok(())
